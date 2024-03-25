@@ -6,9 +6,13 @@ import time
 
 import torch
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 
 from resnet import ResNet_Model
@@ -17,11 +21,11 @@ from resnet import ResNet_Model
 def get_args_parser():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--model", type=str, default="resnet50")
-    parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--lr_decay", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.0001)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument(
         "--train_path", type=str, default="~/datasets/imagenet/imagenet100/train"
@@ -33,6 +37,7 @@ def get_args_parser():
     parser.add_argument("--print_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=10)
     parser.add_argument("--save_folder", type=str, default="./save")
+    parser.add_argument("--gpu_ids", nargs="+", default=["0", "1", "2", "3"])
 
     return parser
 
@@ -109,7 +114,7 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
         end = time.time()
 
         # print info
-        if (idx + 1) % opt.print_freq == 0:
+        if (idx + 1) % opt.print_freq == 0 and opt.rank == 0:
             print(
                 "Train: [{0}][{1}/{2}]\t"
                 "BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
@@ -158,7 +163,7 @@ def validate(val_loader, model, criterion, opt):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if idx % opt.print_freq == 0:
+            if idx % opt.print_freq == 0 and opt.rank == 0:
                 print(
                     "Test: [{0}/{1}]\t"
                     "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
@@ -206,28 +211,28 @@ def set_loader(opt):
 
     train_loader = DataLoader(
         dataset=train_dataset,
-        batch_size=opt.batch_size,
-        shuffle=True,
+        batch_size=int(opt.batch_size / opt.world_size),
+        sampler=DistributedSampler(train_dataset, shuffle=True),
         num_workers=opt.num_workers,
     )
     val_loader = DataLoader(
         dataset=val_dataset,
-        batch_size=opt.batch_size,
-        shuffle=False,
+        batch_size=int(opt.batch_size / opt.world_size),
+        sampler=DistributedSampler(val_dataset, shuffle=False),
         num_workers=opt.num_workers,
     )
 
     return train_loader, val_loader
 
 
-def set_model(opt):
+def set_model(local_gpu_id, opt):
     model = ResNet_Model(name=opt.model, num_classes=opt.num_classes)
     criterion = torch.nn.CrossEntropyLoss()
 
-    if torch.cuda.is_available():
-        model = model.cuda()
-        criterion = criterion.cuda()
-        # cudnn.benchmark = True
+    model = model.cuda(local_gpu_id)
+    model = DDP(model, device_ids=[local_gpu_id])
+    criterion = criterion.cuda(local_gpu_id)
+    # cudnn.benchmark = True
 
     return model, criterion
 
@@ -250,13 +255,35 @@ def save_model(model, optimizer, opt, epoch, save_file):
     del state
 
 
-def main_worker(opt):
+def setup(rank, opt):
+    opt.rank = rank
+    local_gpu_id = int(opt.gpu_ids[rank])
+    torch.cuda.set_device(local_gpu_id)
+    if opt.rank is not None:
+        print("Use GPU: {} for training".format(local_gpu_id))
+
+    dist.init_process_group(
+        backend="nccl",
+        init_method="tcp://127.0.0.1:23456",
+        rank=rank,
+        world_size=opt.world_size,
+    )
+    return local_gpu_id
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+def main_worker(rank, opt):
+    local_gpu_id = setup(rank, opt)
+
     best_acc = 0
 
     # build data loader
     train_loader, val_loader = set_loader(opt)
     # build model and criterion
-    model, criterion = set_model(opt)
+    model, criterion = set_model(local_gpu_id, opt)
     # build optimizer
     optimizer = set_optimizer(opt, model)
     lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=opt.lr_decay)
@@ -278,7 +305,7 @@ def main_worker(opt):
         if val_acc > best_acc:
             best_acc = val_acc
 
-        if epoch % opt.save_freq == 0:
+        if epoch % opt.save_freq == 0 and opt.rank == 0:
             save_file = os.path.join(
                 opt.save_folder, "ckpt_epoch_{epoch}.pth".format(epoch=epoch)
             )
@@ -291,6 +318,7 @@ def main_worker(opt):
     save_model(model, optimizer, opt, opt.epochs, save_file)
 
     print("best accuracy: {:.2f}".format(best_acc))
+    cleanup()
 
 
 if __name__ == "__main__":
@@ -299,4 +327,7 @@ if __name__ == "__main__":
     )
     opt = parser.parse_args()
 
-    main_worker(opt)
+    opt.world_size = len(opt.gpu_ids)
+    assert opt.world_size > 1, "Requires at least 2 GPUs to run"
+
+    mp.spawn(main_worker, args=(opt,), nprocs=opt.world_size, join=True)
